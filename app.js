@@ -6,6 +6,8 @@
 
 const GEOCODE_URL = 'https://geocoding-api.open-meteo.com/v1/search';
 const FORECAST_URL = 'https://api.open-meteo.com/v1/forecast';
+const MET_URL = 'https://api.met.no/weatherapi/locationforecast/2.0/compact';
+const MET_SUN_URL = 'https://api.met.no/weatherapi/sunrise/3.0/sun';
 const REVERSE_URL = 'https://api.bigdatacloud.net/data/reverse-geocode-client';
 
 const DEFAULT_PLACE = {
@@ -14,15 +16,16 @@ const DEFAULT_PLACE = {
   country: 'Россия',
   latitude: 55.7078,
   longitude: 38.9572,
+  timezone: 'Europe/Moscow',
 };
 
 const POPULAR_PLACES = [
   DEFAULT_PLACE,
-  { name: 'Москва', admin1: 'Москва', country: 'Россия', latitude: 55.7558, longitude: 37.6173 },
-  { name: 'Санкт-Петербург', admin1: 'Санкт-Петербург', country: 'Россия', latitude: 59.9386, longitude: 30.3141 },
-  { name: 'Казань', admin1: 'Татарстан', country: 'Россия', latitude: 55.7963, longitude: 49.1088 },
-  { name: 'Новосибирск', admin1: 'Новосибирская область', country: 'Россия', latitude: 55.0084, longitude: 82.9357 },
-  { name: 'Екатеринбург', admin1: 'Свердловская область', country: 'Россия', latitude: 56.8389, longitude: 60.6057 },
+  { name: 'Москва', admin1: 'Москва', country: 'Россия', latitude: 55.7558, longitude: 37.6173, timezone: 'Europe/Moscow' },
+  { name: 'Санкт-Петербург', admin1: 'Санкт-Петербург', country: 'Россия', latitude: 59.9386, longitude: 30.3141, timezone: 'Europe/Moscow' },
+  { name: 'Казань', admin1: 'Татарстан', country: 'Россия', latitude: 55.7963, longitude: 49.1088, timezone: 'Europe/Moscow' },
+  { name: 'Новосибирск', admin1: 'Новосибирская область', country: 'Россия', latitude: 55.0084, longitude: 82.9357, timezone: 'Asia/Novosibirsk' },
+  { name: 'Екатеринбург', admin1: 'Свердловская область', country: 'Россия', latitude: 56.8389, longitude: 60.6057, timezone: 'Asia/Yekaterinburg' },
 ];
 
 const WEATHER = {
@@ -95,6 +98,7 @@ const state = {
   searchTimer: 0,
   controller: null,
   loading: false,
+  preferMet: false,
 };
 
 /* ---------- DOM ---------- */
@@ -166,10 +170,15 @@ function escapeHtml(value) {
 }
 
 function parseLocal(iso) {
-  const [datePart, timePart = '00:00'] = iso.split('T');
-  const [y, m, d] = datePart.split('-').map(Number);
-  const [hh, mm] = timePart.split(':').map(Number);
-  return new Date(y, m - 1, d, hh || 0, mm || 0);
+  const match = String(iso).match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?/);
+  if (!match) return new Date(0);
+  return new Date(
+    Number(match[1]),
+    Number(match[2]) - 1,
+    Number(match[3]),
+    Number(match[4] || 0),
+    Number(match[5] || 0)
+  );
 }
 
 function capitalize(text) {
@@ -305,10 +314,118 @@ function iconSvg(name, isDay = true, size = 'md') {
 }
 
 /* ---------- Data loading ---------- */
-async function fetchForecast(latitude, longitude, signal) {
+function withTimeout(signal, ms) {
+  if (typeof AbortSignal === 'undefined' || !AbortSignal.timeout) return signal;
+  const timeout = AbortSignal.timeout(ms);
+  if (!signal) return timeout;
+  return AbortSignal.any ? AbortSignal.any([signal, timeout]) : signal;
+}
+
+function localIso(date, timeZone) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).formatToParts(date).reduce((acc, part) => {
+    if (part.type !== 'literal') acc[part.type] = part.value;
+    return acc;
+  }, {});
+
+  const hour = String(Number(parts.hour) % 24).padStart(2, '0');
+  return `${parts.year}-${parts.month}-${parts.day}T${hour}:${parts.minute}`;
+}
+
+function timeZoneOffset(date, timeZone) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).formatToParts(date).reduce((acc, part) => {
+    if (part.type !== 'literal') acc[part.type] = part.value;
+    return acc;
+  }, {});
+
+  const asUtc = Date.UTC(
+    Number(parts.year),
+    Number(parts.month) - 1,
+    Number(parts.day),
+    Number(parts.hour) % 24,
+    Number(parts.minute),
+    Number(parts.second)
+  );
+  return Math.round((asUtc - date.getTime()) / 60000);
+}
+
+function formatOffset(minutes) {
+  const sign = minutes >= 0 ? '+' : '-';
+  const abs = Math.abs(minutes);
+  return `${sign}${String(Math.floor(abs / 60)).padStart(2, '0')}:${String(abs % 60).padStart(2, '0')}`;
+}
+
+function metSymbolToCode(symbol) {
+  const s = String(symbol || '').replace(/_(day|night|polartwilight)$/, '');
+  if (s.includes('thunder')) return 95;
+  if (s.includes('heavyrain')) return s.includes('shower') ? 82 : 65;
+  if (s.includes('rainshower')) return s.includes('light') ? 80 : 81;
+  if (s.includes('sleet')) return 66;
+  if (s.includes('heavysnow')) return 75;
+  if (s.includes('lightsnow')) return 71;
+  if (s.includes('snow')) return 73;
+  if (s.includes('lightrain')) return 61;
+  if (s.includes('rain')) return 63;
+  if (s.includes('fog')) return 45;
+  if (s === 'partlycloudy') return 2;
+  if (s === 'cloudy') return 3;
+  if (s === 'fair') return 1;
+  if (s === 'clearsky') return 0;
+  return 3;
+}
+
+function isDaySymbol(symbol, time) {
+  if (/_night$/.test(symbol)) return false;
+  if (/_day$/.test(symbol) || /_polartwilight$/.test(symbol)) return true;
+  const hour = Number(time.slice(11, 13));
+  return hour >= 7 && hour < 19;
+}
+
+function apparentTemperature(t, humidity, wind) {
+  const e = (humidity / 100) * 6.105 * Math.exp((17.27 * t) / (237.7 + t));
+  return t + 0.33 * e - 0.7 * wind - 4;
+}
+
+function dewPoint(t, humidity) {
+  const rh = Math.min(100, Math.max(1, humidity));
+  const gamma = Math.log(rh / 100) + (17.27 * t) / (237.7 + t);
+  return (237.7 * gamma) / (17.27 - gamma);
+}
+
+function pickDayCode(hours) {
+  let best = hours[0];
+  let bestDiff = Infinity;
+  hours.forEach((hour) => {
+    const minutes = Number(hour.time.slice(11, 13)) * 60 + Number(hour.time.slice(14, 16));
+    const diff = Math.abs(minutes - 720);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = hour;
+    }
+  });
+  return best.code;
+}
+
+async function fetchOpenMeteo(place, signal) {
   const params = new URLSearchParams({
-    latitude: String(latitude),
-    longitude: String(longitude),
+    latitude: String(place.latitude),
+    longitude: String(place.longitude),
     timezone: 'auto',
     forecast_days: '7',
     wind_speed_unit: 'ms',
@@ -344,10 +461,178 @@ async function fetchForecast(latitude, longitude, signal) {
     ].join(','),
   });
 
-  const response = await fetch(`${FORECAST_URL}?${params}`, { signal });
+  const response = await fetch(`${FORECAST_URL}?${params}`, { signal: withTimeout(signal, 4500) });
   if (!response.ok) throw new Error(`Forecast HTTP ${response.status}`);
-  return response.json();
+  const data = await response.json();
+  data.source = 'Open-Meteo';
+  return data;
 }
+
+async function fetchMetSunrise(place, dateKey, timeZone, signal) {
+  const offset = formatOffset(timeZoneOffset(new Date(), timeZone));
+  const params = new URLSearchParams({
+    lat: place.latitude.toFixed(4),
+    lon: place.longitude.toFixed(4),
+    date: dateKey,
+    offset,
+  });
+
+  try {
+    const response = await fetch(`${MET_SUN_URL}?${params}`, { signal: withTimeout(signal, 8000) });
+    if (!response.ok) return { sunrise: null, sunset: null };
+    const json = await response.json();
+    const sunrise = json.properties?.sunrise?.time || null;
+    const sunset = json.properties?.sunset?.time || null;
+    return { sunrise, sunset };
+  } catch {
+    return { sunrise: null, sunset: null };
+  }
+}
+
+async function fetchMetForecast(place, signal) {
+  const params = new URLSearchParams({
+    lat: place.latitude.toFixed(4),
+    lon: place.longitude.toFixed(4),
+  });
+
+  const response = await fetch(`${MET_URL}?${params}`, { signal: withTimeout(signal, 12000) });
+  if (!response.ok) throw new Error(`MET HTTP ${response.status}`);
+  const json = await response.json();
+
+  const series = json.properties?.timeseries || [];
+  if (!series.length) throw new Error('MET: пустой ответ');
+
+  const timeZone = place.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const now = Date.now();
+
+  const hours = series.map((item) => {
+    const date = new Date(item.time);
+    const details = item.data.instant.details;
+    const symbol = item.data.next_1_hours?.summary?.symbol_code
+      || item.data.next_6_hours?.summary?.symbol_code
+      || item.data.next_12_hours?.summary?.symbol_code
+      || '';
+    const time = localIso(date, timeZone);
+    const precipitation = item.data.next_1_hours?.details?.precipitation_amount
+      ?? item.data.next_6_hours?.details?.precipitation_amount
+      ?? 0;
+
+    return {
+      date,
+      time,
+      temperature: details.air_temperature,
+      humidity: details.relative_humidity,
+      pressure: details.air_pressure_at_sea_level,
+      windSpeed: details.wind_speed,
+      windDirection: details.wind_from_direction,
+      cloud: details.cloud_area_fraction,
+      code: metSymbolToCode(symbol),
+      isDay: isDaySymbol(symbol, time),
+      precipitation,
+    };
+  });
+
+  let currentIndex = 0;
+  for (let i = 0; i < hours.length; i += 1) {
+    if (hours[i].date.getTime() <= now) currentIndex = i;
+    else break;
+  }
+  const currentHour = hours[currentIndex];
+
+  const dayKeys = [];
+  const dayHours = new Map();
+  hours.forEach((hour) => {
+    const key = hour.time.slice(0, 10);
+    if (!dayHours.has(key)) {
+      dayHours.set(key, []);
+      dayKeys.push(key);
+    }
+    dayHours.get(key).push(hour);
+  });
+
+  const days = dayKeys.slice(0, 7).map((key) => {
+    const list = dayHours.get(key);
+    const temps = list.map((hour) => hour.temperature);
+    return {
+      key,
+      code: pickDayCode(list),
+      max: Math.max(...temps),
+      min: Math.min(...temps),
+      wind: Math.max(...list.map((hour) => hour.windSpeed)),
+    };
+  });
+
+  const sun = await fetchMetSunrise(place, days[0].key, timeZone, signal);
+
+  const data = {
+    source: 'MET Norway',
+    current: {
+      time: currentHour.time,
+      temperature_2m: currentHour.temperature,
+      relative_humidity_2m: currentHour.humidity,
+      apparent_temperature: apparentTemperature(
+        currentHour.temperature,
+        currentHour.humidity,
+        currentHour.windSpeed
+      ),
+      is_day: currentHour.isDay ? 1 : 0,
+      precipitation: currentHour.precipitation,
+      weather_code: currentHour.code,
+      cloud_cover: currentHour.cloud,
+      pressure_msl: currentHour.pressure,
+      wind_speed_10m: currentHour.windSpeed,
+      wind_direction_10m: currentHour.windDirection,
+      wind_gusts_10m: Math.round(currentHour.windSpeed * 1.7 * 10) / 10,
+      dew_point_2m: dewPoint(currentHour.temperature, currentHour.humidity),
+    },
+    hourly: {
+      time: hours.map((hour) => hour.time),
+      temperature_2m: hours.map((hour) => hour.temperature),
+      precipitation_probability: hours.map(() => null),
+      weather_code: hours.map((hour) => hour.code),
+      is_day: hours.map((hour) => (hour.isDay ? 1 : 0)),
+    },
+    daily: {
+      time: days.map((day) => day.key),
+      weather_code: days.map((day) => day.code),
+      temperature_2m_max: days.map((day) => day.max),
+      temperature_2m_min: days.map((day) => day.min),
+      sunrise: days.map((day, index) => (index === 0 ? sun.sunrise : null)),
+      sunset: days.map((day, index) => (index === 0 ? sun.sunset : null)),
+      precipitation_probability_max: days.map(() => null),
+      wind_speed_10m_max: days.map((day) => day.wind),
+      uv_index_max: days.map(() => null),
+    },
+  };
+
+  return data;
+}
+
+async function fetchForecast(place, signal) {
+  if (state.preferMet) {
+    try {
+      return await fetchMetForecast(place, signal);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      console.warn('MET Norway недоступен, пробуем Open-Meteo:', error?.message || error);
+      const data = await fetchOpenMeteo(place, signal);
+      state.preferMet = false;
+      storage.set('weather.provider', null);
+      return data;
+    }
+  }
+
+  try {
+    return await fetchOpenMeteo(place, signal);
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    console.warn('Open-Meteo недоступен, переключаемся на MET Norway:', error?.message || error);
+    state.preferMet = true;
+    storage.set('weather.provider', { name: 'met', until: Date.now() + 6 * 60 * 60 * 1000 });
+    return fetchMetForecast(place, signal);
+  }
+}
+
 
 async function reverseGeocode(latitude, longitude) {
   try {
@@ -363,9 +648,17 @@ async function reverseGeocode(latitude, longitude) {
       country: json.countryName || '',
       latitude,
       longitude,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
     };
   } catch {
-    return { name: 'Моё местоположение', admin1: '', country: '', latitude, longitude };
+    return {
+      name: 'Моё местоположение',
+      admin1: '',
+      country: '',
+      latitude,
+      longitude,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+    };
   }
 }
 
@@ -394,10 +687,10 @@ async function loadWeather(place, { save = true } = {}) {
   if (state.controller) state.controller.abort();
   const controller = new AbortController();
   state.controller = controller;
-  const timeoutId = setTimeout(() => controller.abort(), 12000);
+  const timeoutId = setTimeout(() => controller.abort(), 24000);
 
   try {
-    const data = await fetchForecast(place.latitude, place.longitude, controller.signal);
+    const data = await fetchForecast(place, controller.signal);
     if (requestId !== state.requestId) return;
     state.data = data;
     render();
@@ -435,7 +728,8 @@ function setLoading(isLoading) {
 
 function markUpdated() {
   const time = new Intl.DateTimeFormat('ru-RU', { hour: '2-digit', minute: '2-digit' }).format(new Date());
-  els.updated.textContent = `обновлено в ${time}`;
+  const source = state.data?.source;
+  els.updated.textContent = `обновлено в ${time}${source ? ` · ${source}` : ''}`;
 }
 
 function resetView() {
@@ -468,7 +762,7 @@ function render() {
   const meta = weatherMeta(current.weather_code);
   const isDay = current.is_day === 1;
   const hourIndex = currentHourIndex(data);
-  const pop = data.hourly.precipitation_probability?.[hourIndex] ?? 0;
+  const pop = data.hourly.precipitation_probability?.[hourIndex] ?? null;
   const dayMax = daily.temperature_2m_max[0];
   const dayMin = daily.temperature_2m_min[0];
 
@@ -486,7 +780,7 @@ function render() {
   els.chipMax.textContent = temp(dayMax);
   els.chipMin.textContent = temp(dayMin);
   els.chipWind.textContent = windSpeed(current.wind_speed_10m);
-  els.chipPop.textContent = `${Math.round(pop)}%`;
+  els.chipPop.textContent = pop == null ? '—' : `${Math.round(pop)}%`;
 
   /* Details */
   const feelsDiff = Math.round(toUnit(current.apparent_temperature) - toUnit(current.temperature_2m));
@@ -509,14 +803,14 @@ function render() {
   els.dPressureNote.textContent = `${pressureHpa} гПа`;
 
   els.dPrecip.textContent = `${numberFmt.format(current.precipitation)} мм`;
-  els.dPrecipNote.textContent = `Вероятность ${Math.round(pop)}%`;
+  els.dPrecipNote.textContent = pop == null ? 'Вероятность неизвестна' : `Вероятность ${Math.round(pop)}%`;
 
-  const uv = daily.uv_index_max[0] ?? 0;
-  els.dUv.textContent = numberFmt.format(uv);
-  els.dUvNote.textContent = uvLabel(uv);
+  const uv = daily.uv_index_max?.[0];
+  els.dUv.textContent = uv == null ? '—' : numberFmt.format(uv);
+  els.dUvNote.textContent = uv == null ? 'Нет данных' : uvLabel(uv);
 
-  const sunrise = daily.sunrise[0];
-  const sunset = daily.sunset[0];
+  const sunrise = daily.sunrise?.[0];
+  const sunset = daily.sunset?.[0];
 
   if (sunrise && sunset) {
     els.dSunrise.textContent = sunrise.slice(11, 16);
@@ -525,9 +819,9 @@ function render() {
     els.dSunsetNote.textContent = `Световой день ${daylight(sunrise, sunset)}`;
   } else {
     els.dSunrise.textContent = '—';
-    els.dSunriseNote.textContent = 'Полярный день или ночь';
+    els.dSunriseNote.textContent = 'Нет данных';
     els.dSunset.textContent = '—';
-    els.dSunsetNote.textContent = 'Полярный день или ночь';
+    els.dSunsetNote.textContent = 'Нет данных';
   }
 
   renderHours(hourIndex);
@@ -552,14 +846,15 @@ function renderHours(startIndex) {
     const meta = weatherMeta(data.hourly.weather_code[i]);
     const isDay = data.hourly.is_day[i] === 1;
     const time = i === startIndex ? 'Сейчас' : data.hourly.time[i].slice(11, 16);
-    const probability = data.hourly.precipitation_probability?.[i] ?? 0;
+    const probability = data.hourly.precipitation_probability?.[i] ?? null;
+    const rain = probability != null && probability >= 5 ? `${Math.round(probability)}%` : '';
 
     rows.push(`
       <div class="hour${i === startIndex ? ' now' : ''}">
         <span class="hour-time">${time}</span>
         ${iconSvg(meta.icon, isDay, 'sm')}
         <span class="hour-temp">${temp(data.hourly.temperature_2m[i])}</span>
-        <span class="hour-rain">${probability >= 5 ? `${Math.round(probability)}%` : ''}</span>
+        <span class="hour-rain">${rain}</span>
       </div>`);
   }
 
@@ -580,7 +875,9 @@ function renderDays() {
     if (i === 1) name = 'Завтра';
 
     const meta = weatherMeta(daily.weather_code[i]);
-    const probability = Math.round(daily.precipitation_probability_max[i] ?? 0);
+    const rawProbability = daily.precipitation_probability_max?.[i];
+    const probability = rawProbability == null ? null : Math.round(rawProbability);
+    const showProbability = probability != null && probability >= 5;
     const low = daily.temperature_2m_min[i];
     const high = daily.temperature_2m_max[i];
 
@@ -593,7 +890,7 @@ function renderDays() {
       <div class="day">
         <div class="day-name">${name}<small>${shortDateFmt.format(date)}</small></div>
         ${iconSvg(meta.icon, true, 'sm')}
-        <div class="day-precip${probability < 5 ? ' empty' : ''}" title="Вероятность осадков">${probability >= 5 ? `${probability}%` : '—'}</div>
+        <div class="day-precip${showProbability ? '' : ' empty'}" title="Вероятность осадков">${showProbability ? `${probability}%` : '—'}</div>
         <div class="range" aria-hidden="true"><div class="range-fill" style="left:${left.toFixed(2)}%;width:${width.toFixed(2)}%"></div></div>
         <div class="day-temps"><span class="min">${temp(low)}</span><span class="max">${temp(high)}</span></div>
       </div>`);
@@ -685,6 +982,7 @@ async function searchCities(query) {
       country: item.country || '',
       latitude: item.latitude,
       longitude: item.longitude,
+      timezone: item.timezone || '',
     }));
 
     if (!results.length) {
@@ -856,6 +1154,9 @@ function bindEvents() {
 function init() {
   const savedUnit = storage.get('weather.unit', 'c');
   state.unit = savedUnit === 'f' ? 'f' : 'c';
+
+  const provider = storage.get('weather.provider', null);
+  state.preferMet = provider?.name === 'met' && Number(provider.until) > Date.now();
 
   const recents = storage.get('weather.recents', []);
   state.recents = Array.isArray(recents)
